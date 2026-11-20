@@ -1,0 +1,428 @@
+
+const departments = [
+  ["💻", "Computer Science"],
+  ["⚙️", "Engineering"],
+  ["🎨", "Arts & Design"],
+  ["🩺", "Medicine"],
+  ["💬", "Campus Confessions"],
+  ["🎉", "Events"]
+];
+
+let posts = [
+  {
+    id: 1,
+    title: "Why is the examination schedule announced so late?",
+    body: "Does anyone else think we need a proper examination calendar? Students need enough time to plan their preparation.",
+    category: "Medicine",
+    author: "Neon_Scholar",
+    age: "2 hours ago",
+    votes: 48,
+    comments: ["We definitely need a proper schedule.", "Our department should publish it earlier."],
+    saved: false,
+    demo: true
+  },
+  {
+    id: 2,
+    title: "Sometimes university feels lonelier than living alone.",
+    body: "You can be surrounded by hundreds of people and still feel disconnected. Does anyone else experience this?",
+    category: "Confession",
+    author: "Midnight_Owl",
+    age: "4 hours ago",
+    votes: 126,
+    comments: ["I understand this feeling.", "You're definitely not alone."],
+    saved: false,
+    demo: true
+  },
+  {
+    id: 3,
+    title: "What programming language should first-year students learn?",
+    body: "Python, C++ or Java? Looking for suggestions from senior students.",
+    category: "Computer Science",
+    author: "Void_Coder",
+    age: "6 hours ago",
+    votes: 32,
+    comments: ["Python is a good starting point.", "Learn C++ if your curriculum requires it."],
+    saved: false,
+    demo: true
+  },
+  {
+    id: 4,
+    title: "The hostel Wi-Fi needs serious improvement.",
+    body: "Connection drops frequently, especially during the evening. Can we organize a constructive discussion about this?",
+    category: "General",
+    author: "Silent_Orbit",
+    age: "8 hours ago",
+    votes: 67,
+    comments: ["Same problem in our block.", "We should document the issue."],
+    saved: false,
+    demo: true
+  }
+];
+
+let activeFilter = "all";
+let activePage = "home";
+let searchTerm = "";
+let userVotes = {};
+let toastTimer;
+
+const $ = id => document.getElementById(id);
+
+function escapeHTML(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[char]);
+}
+
+function showToast(message) {
+  const toast = $("toast");
+  toast.textContent = message;
+  toast.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove("show"), 2500);
+}
+
+
+// SUPABASE CONNECTION — guest authentication and pseudonymous profile
+let supabaseClient = null;
+let currentUser = null;
+let currentProfile = null;
+
+function updateGuestIdentity(username) {
+  const safeName = username || "Guest";
+  const pill = document.querySelector(".guest-pill");
+  if (pill) pill.innerHTML = '<span class="online-dot"></span> ' + escapeHTML(safeName);
+
+  const footerName = document.querySelector(".sidebar-footer strong");
+  const footerStatus = document.querySelector(".sidebar-footer small");
+  if (footerName) footerName.textContent = safeName;
+  if (footerStatus) footerStatus.textContent = "Connected guest account";
+
+  document.querySelectorAll(".guest-avatar").forEach(el => {
+    el.textContent = safeName.charAt(0).toUpperCase();
+  });
+}
+
+async function connectSupabaseGuest() {
+  const projectUrl = window.TU_SUPABASE_URL;
+  const publishableKey = window.TU_SUPABASE_PUBLISHABLE_KEY;
+
+  if (!window.supabase || !projectUrl || !publishableKey ||
+      projectUrl.includes("PASTE_YOUR") || publishableKey.includes("PASTE_YOUR")) {
+    showToast("Add your Supabase Project URL and Publishable key in supabase-config.js.");
+    return;
+  }
+
+  try {
+    supabaseClient = window.supabase.createClient(projectUrl, publishableKey);
+
+    const { data: sessionData, error: sessionError } = await supabaseClient.auth.getSession();
+    if (sessionError) throw sessionError;
+
+    let user = sessionData.session?.user || null;
+
+    if (!user) {
+      const { data, error } = await supabaseClient.auth.signInAnonymously();
+      if (error) throw error;
+      user = data.user;
+    }
+
+    if (!user) throw new Error("Supabase did not return a user session.");
+    currentUser = user;
+
+    // The database trigger creates this profile automatically after auth signup.
+    // Retry briefly in case the trigger/profile row is not immediately visible.
+    let profile = null;
+    let profileError = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const result = await supabaseClient
+        .from("profiles")
+        .select("username, display_name, department")
+        .eq("id", user.id)
+        .maybeSingle();
+      profile = result.data;
+      profileError = result.error;
+      if (profile || profileError) break;
+      await new Promise(resolve => setTimeout(resolve, 400));
+    }
+
+    if (profileError) throw profileError;
+    if (!profile) throw new Error("Guest account exists, but its profile was not created. Check the auth profile trigger and RLS policies.");
+
+    currentProfile = profile;
+    updateGuestIdentity(profile.username);
+    showToast("Connected to The Underground as " + profile.username + ".");
+  } catch (error) {
+    console.error("Supabase connection error:", error);
+    showToast("Supabase connection failed: " + (error.message || "Unknown error"));
+  }
+}
+
+function renderDepartments() {
+  $("departmentList").innerHTML = departments.map(([icon, name]) => `
+    <button class="nav-item department-btn" data-department="${escapeHTML(name)}">
+      ${icon} <span>${escapeHTML(name)}</span>
+    </button>
+  `).join("");
+}
+
+function renderPosts() {
+  const container = $("posts");
+  let filtered = [...posts];
+
+  if (activePage === "confessions") {
+    filtered = filtered.filter(p => p.category === "Confession");
+  } else if (activePage === "saved") {
+    filtered = filtered.filter(p => p.saved);
+  } else if (activePage === "concerns") {
+    filtered = filtered.filter(p => p.category === "Campus Concern");
+  } else if (activePage === "events") {
+    filtered = filtered.filter(p => p.category === "Events");
+  } else if (activePage === "department") {
+    filtered = filtered.filter(p => p.category === activeFilter);
+  }
+
+  if (activeFilter !== "all" && activePage !== "department") {
+    filtered = filtered.filter(p => p.category === activeFilter);
+  }
+
+  if (searchTerm) {
+    filtered = filtered.filter(p =>
+      (p.title + " " + p.body + " " + p.category + " " + p.author)
+      .toLowerCase().includes(searchTerm)
+    );
+  }
+
+  const sort = $("sortSelect").value;
+  if (sort === "top" || sort === "hot") {
+    filtered.sort((a, b) => b.votes - a.votes);
+} else {
+  filtered.sort((a, b) => b.id - a.id);
+}
+
+  $("emptyState").classList.toggle("hidden", filtered.length !== 0);
+
+  container.innerHTML = filtered.map(post => {
+    const vote = userVotes[post.id] || 0;
+    const score = post.votes;
+
+    return `
+      <article class="post-card" data-id="${post.id}">
+        <div class="post-top">
+          <div class="post-author">
+            <div class="mini-avatar">${escapeHTML(post.author.charAt(0).toUpperCase())}</div>
+            <div>
+              <strong>${escapeHTML(post.author)}</strong>
+              <small>${escapeHTML(post.age)} · Guest identity</small>
+            </div>
+          </div>
+          <span class="flair">${escapeHTML(post.category)}</span>
+        </div>
+
+        <h3>${escapeHTML(post.title)}</h3>
+        <p class="post-body">${escapeHTML(post.body)}</p>
+
+        <div class="post-actions">
+          <button class="action-btn ${vote === 1 ? "selected" : ""}"
+            data-vote="1" data-id="${post.id}">
+            ↑ ${score}
+          </button>
+          <button class="action-btn ${vote === -1 ? "selected" : ""}"
+            data-vote="-1" data-id="${post.id}">
+            ↓
+          </button>
+          <button class="action-btn" data-open="${post.id}">
+            ◯ ${post.comments.length} Comments
+          </button>
+          <span class="action-spacer"></span>
+          <button class="action-btn ${post.saved ? "selected" : ""}"
+            data-save="${post.id}">
+            ♧ ${post.saved ? "Saved" : "Save"}
+          </button>
+        </div>
+      </article>
+    `;
+  }).join("");
+}
+
+function setPage(page, department) {
+  activePage = page;
+  activeFilter = department || "all";
+
+  const titles = {
+    home: "Your campus, unfiltered.",
+    trending: "Trending discussions.",
+    confessions: "Whispers from campus.",
+    saved: "Your saved discussions.",
+    events: "Campus events.",
+    concerns: "Campus concerns.",
+    department: department
+  };
+
+  $("feedTitle").textContent = titles[page] || "Your campus, unfiltered.";
+
+  document.querySelectorAll(".nav-item,.mobile-tab").forEach(btn => {
+    btn.classList.remove("active");
+  });
+
+  document.querySelectorAll(`[data-page="${page}"]`).forEach(btn => {
+    btn.classList.add("active");
+  });
+
+  document.querySelectorAll(".department-btn").forEach(btn => {
+    if (btn.dataset.department === department) {
+      btn.classList.add("active");
+    }
+  });
+
+  document.querySelectorAll(".filter").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.filter === "all");
+  });
+
+  renderPosts();
+}
+
+function toggleComposer() {
+  $("composerPanel").classList.toggle("hidden");
+  if (!$("composerPanel").classList.contains("hidden")) {
+    $("postTitle").focus();
+    $("composerPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+}
+
+function publishPost() {
+  const title = $("postTitle").value.trim();
+  const body = $("postBody").value.trim();
+  const category = $("postCategory").value;
+
+  if (!title || !body) {
+    showToast("Please enter a title and post content.");
+    return;
+  }
+
+  const post = {
+    id: Date.now(),
+    title,
+    body,
+    category,
+    author: "Anonymous_Guest",
+    age: "Just now",
+    votes: 0,
+    comments: [],
+    saved: false,
+    demo: false
+  };
+
+  posts.unshift(post);
+  $("postTitle").value = "";
+  $("postBody").value = "";
+  $("composerPanel").classList.add("hidden");
+
+  setPage("home");
+  $("sortSelect").value = "new";
+  renderPosts();
+  showToast("Demo post created in this browser session.");
+}
+
+function openPost(id) {
+  const post = posts.find(p => p.id === Number(id));
+  if (!post) return;
+
+  $("modalContent").innerHTML = `
+    <span class="eyebrow">${escapeHTML(post.category)}</span>
+    <h2 id="modalTitle">${escapeHTML(post.title)}</h2>
+    <p class="post-body">${escapeHTML(post.body)}</p>
+    <p class="demo-note">Posted by ${escapeHTML(post.author)} · ${escapeHTML(post.age)}</p>
+    <hr style="border-color:#30243e">
+    <h3>Comments (${post.comments.length})</h3>
+    ${post.comments.map(comment => `
+      <div class="modal-comment">${escapeHTML(comment)}</div>
+    `).join("")}
+    <p class="demo-note">Comment creation will be connected in a later stage.</p>
+  `;
+
+  $("postModal").classList.remove("hidden");
+}
+
+function handleVote(id, direction) {
+  const post = posts.find(p => p.id === Number(id));
+  if (!post) return;
+
+  const oldVote = userVotes[id] || 0;
+  post.votes += direction - oldVote;
+  userVotes[id] = oldVote === direction ? 0 : direction;
+
+  if (userVotes[id] === 0) {
+    post.votes -= direction;
+  }
+
+  renderPosts();
+}
+
+function handleSave(id) {
+  const post = posts.find(p => p.id === Number(id));
+  if (!post) return;
+  post.saved = !post.saved;
+  renderPosts();
+  showToast(post.saved ? "Added to saved posts." : "Removed from saved posts.");
+}
+
+document.addEventListener("click", event => {
+  const pageButton = event.target.closest("[data-page]");
+  const departmentButton = event.target.closest("[data-department]");
+  const voteButton = event.target.closest("[data-vote]");
+  const saveButton = event.target.closest("[data-save]");
+  const openButton = event.target.closest("[data-open]");
+  const filterButton = event.target.closest("[data-filter]");
+
+  if (pageButton) setPage(pageButton.dataset.page);
+  if (departmentButton) {
+    setPage("department", departmentButton.dataset.department);
+  }
+  if (voteButton) handleVote(voteButton.dataset.id, Number(voteButton.dataset.vote));
+  if (saveButton) handleSave(saveButton.dataset.save);
+  if (openButton) openPost(openButton.dataset.open);
+
+  if (filterButton) {
+    activeFilter = filterButton.dataset.filter;
+    document.querySelectorAll(".filter").forEach(btn =>
+      btn.classList.toggle("active", btn === filterButton)
+    );
+    renderPosts();
+  }
+});
+
+$("openComposer").addEventListener("click", toggleComposer);
+$("quickCreate").addEventListener("click", toggleComposer);
+$("mobileCreate").addEventListener("click", toggleComposer);
+$("publishPost").addEventListener("click", publishPost);
+
+$("sortSelect").addEventListener("change", renderPosts);
+
+$("searchInput").addEventListener("input", event => {
+  searchTerm = event.target.value.trim().toLowerCase();
+  renderPosts();
+});
+
+$("closeModal").addEventListener("click", () =>
+  $("postModal").classList.add("hidden")
+);
+
+$("postModal").addEventListener("click", event => {
+  if (event.target === $("postModal")) {
+    $("postModal").classList.add("hidden");
+  }
+});
+
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    $("postModal").classList.add("hidden");
+  }
+});
+
+renderDepartments();
+setPage("home");
+connectSupabaseGuest();
